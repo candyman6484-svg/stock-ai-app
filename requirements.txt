@@ -1,0 +1,8 @@
+streamlit
+google-generativeai
+finance-datareader
+yfinance
+requests
+pandas
+beautifulsoup4
+lxml
