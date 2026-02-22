@@ -13,8 +13,8 @@ import json
 # [설정] 페이지 기본 설정
 # -----------------------------------------------------------
 st.set_page_config(
-    page_title="AI 주식 비서 (가치+차트+수급)",
-    page_icon="👑",
+    page_title="AI 주식 비서 (가치+차트+수급+옵션)",
+    page_icon="🦅",
     layout="centered"
 )
 
@@ -38,7 +38,7 @@ HEADERS = {
     'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
 }
 
-# --- 기술적 지표 계산 함수 ---
+# --- 기술적 지표 계산 함수 (기존 유지) ---
 def add_technical_indicators(df):
     if len(df) < 20: return {}
     info = {}
@@ -80,7 +80,62 @@ def add_technical_indicators(df):
         info['매물대_분석'] = "최대 매물대 구간에서 힘겨루기 중"
     return info
 
-# --- 데이터 수집 함수 ---
+# --- ★ [새로 추가됨] 옵션 데이터 계산 함수 ★ ---
+def get_options_data(stock):
+    try:
+        options = stock.options
+        if not options: return "옵션 데이터 없음"
+        
+        # 가장 가까운 만기일(보통 이번 주 금요일) 선택
+        nearest_expiry = options[0]
+        chain = stock.option_chain(nearest_expiry)
+        
+        calls = chain.calls
+        puts = chain.puts
+        
+        if calls.empty and puts.empty: return "옵션 체인 데이터 없음"
+        
+        # 1. 미결제약정(Open Interest) 및 Put/Call Ratio
+        call_oi = calls['openInterest'].sum()
+        put_oi = puts['openInterest'].sum()
+        total_oi = call_oi + put_oi
+        pc_ratio = round(put_oi / call_oi, 2) if call_oi > 0 else 0
+        
+        # 2. Max Pain (마켓 메이커들이 가장 이득을 보는/옵션 매수자가 가장 큰 손실을 보는 가격)
+        strikes = set(calls['strike']).union(set(puts['strike']))
+        max_pain = 0
+        min_loss = float('inf')
+        
+        for strike in strikes:
+            call_loss = calls[calls['strike'] < strike]['openInterest'] * (strike - calls[calls['strike'] < strike]['strike'])
+            put_loss = puts[puts['strike'] > strike]['openInterest'] * (puts[puts['strike'] > strike]['strike'] - strike)
+            total_loss = call_loss.sum() + put_loss.sum()
+            
+            if total_loss < min_loss:
+                min_loss = total_loss
+                max_pain = strike
+
+        # 3. 내재 변동성(Implied Volatility) - 등가격(ATM) 근처 평균
+        current_price = stock.history(period="1d")['Close'].iloc[-1]
+        atm_call = calls.iloc[(calls['strike'] - current_price).abs().argsort()[:1]]
+        atm_put = puts.iloc[(puts['strike'] - current_price).abs().argsort()[:1]]
+        
+        atm_iv = 0
+        if not atm_call.empty and not atm_put.empty:
+            atm_iv = (atm_call['impliedVolatility'].values[0] + atm_put['impliedVolatility'].values[0]) / 2
+            atm_iv = round(atm_iv * 100, 2)
+
+        return {
+            "분석기준_만기일": nearest_expiry,
+            "풋콜비율(PCR)": pc_ratio,
+            "총_미결제약정(OI)": int(total_oi),
+            "맥스페인(Max_Pain)": max_pain,
+            "등가격_내재변동성(IV)": f"{atm_iv}%"
+        }
+    except Exception as e:
+        return f"옵션 데이터 수집 실패: {str(e)}"
+
+# --- 데이터 수집 함수 (기존 유지) ---
 def get_kr_stock_code(name):
     try:
         df = fdr.StockListing('KRX')
@@ -145,21 +200,22 @@ def get_yahoo_data(ticker):
         data["뉴스"] = [n['title'] for n in news[:5] if 'title' in n]
     except: pass
 
-    # ★ [추가됨] SEC 13F 기반 대형 기관 보유 현황 크롤링 ★
     try:
         inst_holders = stock.institutional_holders
         if inst_holders is not None and not inst_holders.empty:
-            # 상위 5개 기관의 데이터를 가져와 문자열로 변환 (오류 방지)
             data["13F_대형기관_보유현황"] = inst_holders.head(5).astype(str).to_dict(orient='records')
     except Exception as e:
         data["13F_대형기관_보유현황"] = "조회 불가"
+
+    # ★ [추가됨] 미국 주식 옵션 데이터 추가 ★
+    data["옵션시장_동향"] = get_options_data(stock)
     
     return data
 
-# --- AI 분석 로직 ---
+# --- AI 분석 로직 (옵션 프롬프트 추가) ---
 def analyze_stock(name, data):
     prompt = f"""
-    당신은 '워렌 버핏의 가치 투자 철학', '월스트리트의 기술적 분석', 그리고 '헤지펀드의 수급 추적'을 모두 통달한 수석 투자 전략가입니다.
+    당신은 '가치 투자', '차트 분석', '수급 흐름', 그리고 **'옵션 시장의 심리(파생상품)'**까지 모두 꿰뚫어 보는 월스트리트 최상위 헤지펀드 매니저입니다.
 
     [분석 데이터]
     {json.dumps(data, ensure_ascii=False, default=str)}
@@ -167,40 +223,44 @@ def analyze_stock(name, data):
     [보고서 작성 가이드]
     
     1. 🏰 **경제적 해자 및 비즈니스 (Fundamental)**
-       - 핵심 경쟁력, 미래 성장성, 잠재적 리스크를 분석하세요.
+       - 핵심 경쟁력, 미래 성장성, 잠재적 리스크.
 
     2. 📊 **기술적 위치 및 타이밍 (Technical)**
-       - 365선, 볼린저 밴드, 매물대 데이터를 근거로 현재 가격의 매력도와 타이밍을 분석하세요.
+       - 365선, 볼린저 밴드, 매물대 데이터를 근거로 현재 가격의 매력도 분석.
 
     3. 🐋 **스마트 머니 동향 (13F Institutional Holders)**
-       - 제공된 '13F_대형기관_보유현황' 데이터를 바탕으로 어떤 대형 기관(Vanguard, BlackRock 등)이 이 기업을 신뢰하고 보유 중인지 분석하세요. (데이터가 없다면 생략 가능)
-       - 기관의 지분이 탄탄하게 받쳐주고 있는지, 수급 측면에서의 안정성을 평가하세요.
+       - 대형 기관들의 지분 현황을 통한 수급 안정성 평가.
 
-    4. 💡 **종합 투자 전략 (Verdict)**
-       - 기업의 본질 가치, 차트 타이밍, 대형 기관의 수급을 종합하여 최종 결론을 내리세요.
-       - 최종 투자 의견(Strong Buy / Buy / Hold / Sell)과 그 이유를 명확히 제시하세요.
+    4. 📉 **옵션 시장 심리 분석 (Options Market)** (※ 옵션 데이터가 있을 경우에만 작성)
+       - **Put/Call Ratio (PCR)**: 시장 참여자들이 하락(Put)에 베팅하는지, 상승(Call)에 베팅하는지 탐욕/공포 상태를 분석하세요. (통상 1.0 이상은 약세/공포, 1.0 이하는 강세/탐욕)
+       - **Max Pain (맥스페인)**: 마켓 메이커들의 이익이 극대화되는 '맥스페인 가격'이 현재 주가 대비 위에 있는지, 아래에 있는지 비교하여 단기적인 주가 자석 효과(끌림 현상)를 예측하세요.
+       - **내재변동성(IV) 및 미결제약정**: 향후 주가의 변동폭이 클 것으로 예상되는지 분석하세요.
 
-    반드시 마크다운(Markdown) 형식을 사용하여 가독성 있게 작성하세요.
+    5. 💡 **종합 투자 전략 (Verdict)**
+       - 가치, 차트, 수급, 옵션 심리 4박자를 모두 고려하여 최종 결론을 내리세요.
+       - 최종 투자 의견(Strong Buy / Buy / Hold / Sell)과 핵심 이유를 요약하세요.
+
+    반드시 마크다운(Markdown) 형식을 사용하여 전문적이고 가독성 있게 작성하세요.
     """
     return model.generate_content(prompt).text
 
 # --- 📱 화면 구성 (UI) ---
-st.title("👑 AI 주식 비서 (가치+차트+수급)")
-st.markdown("재무제표, 차트 분석에 이어 **13F 공시 기반 대형 기관의 움직임**까지 추적합니다.")
+st.title("🦅 AI 주식 비서 (가치+차트+수급+옵션)")
+st.markdown("재무제표, 차트, 13F 기관 수급에 이어 **옵션 시장의 맥스페인(Max Pain)과 풋콜비율**까지 통합 분석합니다.")
 
-query = st.text_input("분석할 기업명 또는 티커 (예: 삼성전자, NVDA, PLTR)", placeholder="입력 후 엔터...")
+query = st.text_input("분석할 기업명 또는 티커 (예: 삼성전자, NVDA, TSLA)", placeholder="입력 후 엔터...")
 
-if st.button("전문가 분석 시작 🚀"):
+if st.button("월스트리트급 분석 시작 🚀"):
     if not query:
         st.warning("기업 이름을 입력해주세요!")
     else:
-        with st.spinner(f"🤖 '{query}'의 해자, 차트, 기관 수급을 샅샅이 뒤지는 중..."):
+        with st.spinner(f"🤖 '{query}'의 해자, 차트, 기관 수급, 옵션 체인까지 전부 분석 중..."):
             final_data = {}
             
             if re.search('[가-힣]', query):
                 code = get_kr_stock_code(query)
                 if code:
-                    st.success(f"한국 주식: {query} (13F 수급 데이터는 미국 주식에 한함)")
+                    st.success(f"한국 주식: {query} (※ 13F 및 옵션 데이터는 미국 주식 전용입니다)")
                     final_data = get_naver_data(code)
                 else:
                     st.error("종목을 찾을 수 없습니다.")
